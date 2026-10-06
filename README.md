@@ -68,23 +68,152 @@ Silence means either a clean day or a problem with the script. To tell which, op
 
 Limits to know: the script only sees what the digest email contains, so the digest must be set up and must arrive. If the digest layout changes, the parsing needs a small update. A report with 0 records can be normal for some crawlers, so red still needs a quick check. The goal is to save time and manual work, not to be 100% sure an issue is real.
 
-## Settings
+## Customize it
 
-Edit these near the top of `Code.gs`. Changes apply on the next check. Only changing `alertCheckEveryMinutes` needs `setupMonitoring` to be run again.
+You can change the alert time, the channels, the projects and more. Each change is one line, and you don't need to understand the rest of the code.
+
+### How to change a setting
+
+1. Open your Sheet and go to **Extensions > Apps Script**.
+2. Click `Code.gs`. The settings are in a block called `CONFIG` at the very top.
+3. Find the line you want (the examples below show each one) and change only the value.
+4. Click **Save** (the disk icon). The change applies from the next check, so there is nothing to run.
+
+Two exceptions: after changing `alertCheckEveryMinutes` or `trendCheckEnabled`, run `setupMonitoring` once more.
+
+Keep the quotes, commas and brackets exactly as they are, and change only what is inside them. If something stops working, undo your change and save again.
+
+### Change the time of the alert
+
+Find these two lines:
+
+```js
+alertHour: 10,
+alertMinute: 30,
+```
+
+Use 24 hour time. For 4:00 pm, write:
+
+```js
+alertHour: 16,
+alertMinute: 0,
+```
+
+The alert comes within about 10 minutes after this time, never before it. Each alert covers the 24 hours before the alert time. If today's alert has already gone out, the new time starts tomorrow.
+
+### Change the timezone
+
+Find this line:
+
+```js
+reportTimezone: 'Asia/Kathmandu',
+```
+
+Replace the name with yours, for example `'Asia/Kolkata'` or `'America/New_York'`. You can find yours in the "TZ identifier" column of the [list of timezone names](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). The alert time above is read in this timezone.
+
+### Send the alert to another channel, or to several
+
+There is no code to change for this.
+
+1. In the new channel, run `/invite @YourAppName`.
+2. Copy the channel's **Channel ID** from its details panel.
+3. Open **Project Settings > Script properties** and edit `SLACK_CHANNEL_ID`. Put the IDs one after another, separated by commas: `C0123ABCD9,C0456EFGH1`.
+
+Each channel gets its own full copy of the alert. To move the alert to a new channel instead, replace the old ID with the new one.
+
+### Skip a project
+
+Find this line:
+
+```js
+ignoredProjects: [],
+```
+
+Put the project name inside the brackets, exactly as it appears in the alert:
+
+```js
+ignoredProjects: ['Acme-Acme Retail'],
+```
+
+For more than one project, separate the names with commas: `['Acme-Acme Retail', 'Other-Other Co']`. Its weekly and monthly digests are skipped too. Remove the name to watch the project again. This is useful for crawlers that normally return 0 records.
+
+### Tag the owner of a project
+
+Find `PROJECT_OWNERS`, just below the settings. It looks like this:
+
+```js
+const PROJECT_OWNERS = Object.freeze({
+});
+```
+
+Add one line between the two brackets for each project:
+
+```js
+const PROJECT_OWNERS = Object.freeze({
+  'Acme-Acme Retail': 'U0123ABCD',
+});
+```
+
+The left side is the project name exactly as it appears in the alert. The right side is the person's Slack member ID: open their profile, click the three dots and choose **Copy member ID**. That person is tagged in the project's thread.
+
+Weekly and monthly digests count as separate names ending in `(weekly)` or `(monthly)`. Add another line for them if you want them tagged too, like `'Acme-Acme Retail (weekly)': 'U0123ABCD',`.
+
+### Hide a type of problem
+
+Find this line:
+
+```js
+ignoredSections: ['crawlerAnomalies', 'profilerAnomalies', 'missedRuns'],
+```
+
+Add a name to hide that problem, or remove a name to show it. The names you can use:
+
+| Name | Problem |
+| --- | --- |
+| `failedRuns` | Failed runs |
+| `dataValidation` | QA rules failures |
+| `failedTasks` | Child process failures |
+| `longRunning` | Long running crawlers |
+| `missedRuns` | Missed runs |
+| `crawlerAnomalies` | Crawler anomalies |
+| `profilerAnomalies` | Profiler anomalies |
+
+For example, to hide long running crawlers, add `'longRunning'` inside the brackets.
+
+### Check more or less often
+
+Find this line:
+
+```js
+alertCheckEveryMinutes: 10,
+```
+
+Use 1, 5, 10, 15 or 30. A lower number puts the alert closer to the time you set. Then run `setupMonitoring` once more.
+
+### Check that it worked
+
+- **Time or timezone:** there is no preview. After the new time, open **Executions**, open the latest `monitorDigestAlerts` run and read its log.
+- **Skipped projects, hidden problems or owners:** run `postAlertThreadNow` to see the result right now. It posts to every channel in `SLACK_CHANNEL_ID`, so point it at a test channel first.
+
+### What cannot be changed yet
+
+- More than one alert a day.
+- Different times, or different channels, for different projects.
+- Picking only some projects. You can skip projects, but you cannot list the ones to keep.
+
+### All settings
 
 | Setting | What it does | Default |
 | --- | --- | --- |
 | `reportTimezone` | Timezone for the alert time and the Sheet | Asia/Kathmandu |
 | `alertHour`, `alertMinute` | Earliest time the alert may post | 10 and 30 |
 | `alertCheckEveryMinutes` | How often the script checks whether it is time to post | 10 |
-| `windowHours` | How far back each alert looks | 24 |
-| `currentGmailQuery` | Which emails count as digests. Change it if yours come from another sender or have another subject | The Grepsr sender, with this day, this week or this month |
-| `ignoredProjects` | Projects to skip completely, written exactly as they appear in the alert. Good for crawlers that normally return 0 records | Empty |
+| `windowHours` | How far back each alert looks. Keep it at 24 for one alert a day, so no digest is missed | 24 |
+| `currentGmailQuery` | Which emails count as digests. Change it only if yours come from another sender or have another subject | The Grepsr sender, with this day, this week or this month |
+| `ignoredProjects` | Projects to skip completely | Empty |
 | `ignoredSections` | Digest sections to skip | Crawler anomalies, profiler anomalies, missed runs |
-| `PROJECT_OWNERS` | A project name and a Slack member ID, so the owner is tagged in that project's thread | Empty |
+| `PROJECT_OWNERS` | Project names and Slack member IDs, so the owner is tagged in that project's thread | Empty |
 | `trendCheckEnabled` | An optional 7 day comparison that also catches slow declines | false (off) |
-
-To find a Slack member ID, open the person's profile, click the three dots and choose **Copy member ID**.
 
 ## If something goes wrong
 
@@ -102,7 +231,7 @@ To find a Slack member ID, open the person's profile, click the three dots and c
 
 ## Updating
 
-Change `src/Code.gs` in this repo, then paste the new code into the Apps Script editor of each Sheet that uses it. Script properties and triggers stay as they are, but your edits to the settings above are replaced, so re-apply them after pasting.
+Change `src/Code.gs` in this repo, then paste the new code into the Apps Script editor of each Sheet that uses it. Script properties and triggers stay as they are, but your edits to the settings are replaced, so re-apply them after pasting.
 
 ## Keep secrets out of the repo
 
