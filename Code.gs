@@ -1,34 +1,71 @@
 /**
- * Grepsr daily digest monitor for Gmail and Slack.
+ * Grepsr digest monitor for Gmail and Slack.
  *
- * Once a day, at or after 10:30 (see CONFIG.alertHour / alertMinute, in
- * CONFIG.reportTimezone), the script reads every digest received in the last
- * 24 hours (from yesterday's alert time until now) and posts a single Slack
- * alert. A digest is included when it contains an
- * explicit flag: an alert section above zero, a comment such as COUNT_ALERT or
- * FILL_RATE_ALERT, or a report still running. The optional seven day trend
- * check (CONFIG.trendCheckEnabled) is off by default.
+ * Runs at the times each team chooses, without anyone editing the code.
+ * The simple way: add ALERT_TIMES in Script properties (for example
+ * 10:00, 13:00, 16:00) and run setupMonitoring once. The script then books a
+ * one-time trigger for each time and, after each run, books the next day's,
+ * so the alert lands within a few minutes of each time, every day.
+ * (Teams can instead add their own Day timer triggers on monitorDigestAlerts
+ * in the Triggers page; those fire somewhere inside the chosen hour.)
  *
- * Alerts are posted through the Slack Web API (chat.postMessage) with a bot
- * token, so each run produces ONE main message (a board grouped by urgency,
- * one line per project), with each project's details posted as a short,
- * plain-language reply in its thread. Slack incoming webhooks cannot thread,
- * so they are not used for this path.
+ * Each run reads every digest received since the previous run and posts one
+ * Slack message when something is flagged. With 10:00, 13:00 and 16:00, the
+ * 13:00 run covers 10 to 1, the 16:00 run covers 1 to 4, and the next day's
+ * 10:00 run covers 4pm to 10am.
+ *
+ * The window is stored in the LAST_ALERT_STATE script property, with one
+ * start time per Slack channel. After a run, a channel's start moves to the
+ * end of that run's window once the channel received the alert (or when
+ * nothing needed attention). A channel whose post failed keeps its old start,
+ * so it gets those digests on the next run. Consecutive runs join up with no
+ * gap and no overlap.
+ *
+ * A digest is included when it contains an explicit flag: an alert section
+ * above zero, a comment such as COUNT_ALERT or FILL_RATE_ALERT, or a report
+ * still running. The optional seven day trend check
+ * (CONFIG.trendCheckEnabled) is off by default.
+ *
+ * The alert is ONE Slack message (chat.postMessage with a bot token): a table
+ * with one row per report and three columns, Project, Report (linked to the
+ * report) and Status (a colored dot). There are no thread
+ * replies. A very long alert continues in a second message, because Slack
+ * limits the size of one table.
  */
 
 const CONFIG = Object.freeze({
   // Daily, weekly and monthly digests. The subject can read "Alerts for X this day",
   // "1 Failed, 2 Data Alerts for X this day", "1 Failed for X this week" and so on, so
   // only the "for <project> this <period>" part is relied on. The exact filtering
-  // is done again in code. newer_than is wide on purpose, see windowHours.
-  currentGmailQuery: 'from:noreply@grepsr.com (subject:"this day" OR subject:"this week" OR subject:"this month") newer_than:2d',
+  // is done again in code. No newer_than here: loadCurrentDigests_ adds an
+  // "after:" filter based on the saved window start.
+  currentGmailQuery: 'from:noreply@grepsr.com (subject:"this day" OR subject:"this week" OR subject:"this month")',
   reportTimezone: 'Asia/Kathmandu',
+  // Run times are NOT set here, so the code stays the same for every team.
+  // Each team adds ALERT_TIMES in Script properties (for example
+  // 10:00, 13:00, 16:00, read in reportTimezone) and runs setupMonitoring.
+  // These are the names of the properties the schedule uses.
+  alertTimesProperty: 'ALERT_TIMES',
+  scheduleProperty: 'ALERT_SCHEDULE',
+  // Google allows about 20 triggers per script; one is booked per time.
+  maximumAlertTimes: 15,
+  //
+  // Only for the very first run, before any window start is saved.
+  firstRunLookbackHours: 24,
+  // Longest window one run may cover (catch-up after an outage).
+  maximumWindowHours: 168,
+  // Each window ends this many minutes before the run starts. A digest that
+  // arrives in those last minutes is picked up by the next run instead, so a
+  // message Gmail has not finished indexing is never skipped.
+  digestSettleMinutes: 5,
+  // Only used once, when upgrading from the old once-a-day version: its last
+  // alert covered digests up to this time on the day it saved.
+  legacyAlertHour: 10,
+  legacyAlertMinute: 30,
   // The seven day trend check is switched off. The digest already flags
   // count and fill rate changes itself (its COUNT and FILL RATE comments), so
   // this only added alerts for smaller changes the digest treated as normal.
-  // Set to true to bring it back for a tailored setup. The hourly sheet
-  // refresh below only exists to feed it, so setupMonitoring creates that
-  // trigger only when this is true.
+  // Set to true to bring it back for a tailored setup.
   trendCheckEnabled: false,
   historyDays: 7,
   minimumHistoryPoints: 3,
@@ -39,43 +76,28 @@ const CONFIG = Object.freeze({
   webhookProperty: 'SLACK_WEBHOOK_URL',
   botTokenProperty: 'SLACK_BOT_TOKEN',
   channelProperty: 'SLACK_CHANNEL_ID',
+  // Pause between messages when a long alert needs a second message.
   slackReplyDelayMs: 1100,
-  bigDropPercent: 30,
-  minimumUsualForRed: 20,
-  maximumReportLines: 6,
-  maximumGroupNames: 8,
-  maximumProjectLines: 25,
-  maximumProcessingNames: 4,
   slackSectionLimit: 2900,
+  // Slack allows one table per message, at most 100 rows (header included)
+  // and 10,000 characters across its cells. A longer alert continues in the
+  // next message.
+  maximumTableRows: 100,
+  maximumTableCharacters: 9000,
+  maximumCellCharacters: 150,
   lastAlertProperty: 'LAST_ALERT_STATE',
-  // The earliest time the daily alert may post, in reportTimezone. Apps Script
-  // daily triggers only promise a rough window and can fire early, so the
-  // trigger runs every alertCheckEveryMinutes (1, 5, 10, 15 or 30) and the
-  // script itself refuses to post before this time. The alert posts on the
-  // first check at or after it, so between 10:30 and about 10:40 by default.
-  alertHour: 10,
-  alertMinute: 30,
-  alertCheckEveryMinutes: 10,
-  // How far back each run looks, counted back from today's alert time (not from
-  // the moment the script happens to run), so consecutive days leave no gap.
-  // With the alert at 10:30 the window runs from 10:30 yesterday until now.
-  windowHours: 24,
   // Digest sections the script reads but deliberately ignores everywhere:
-  // no alert, no thread line, no daily summary total. Remove a key from this
+  // no alert, no table row, no daily summary total. Remove a key from this
   // list to start reporting that section again.
   ignoredSections: ['crawlerAnomalies', 'profilerAnomalies', 'missedRuns'],
-  // Report links longer than this are shown as plain names. The digest email
-  // only contains click tracking links of about 500 characters each, which
-  // would fill the message and get cut off. Short direct links still work.
-  maximumLinkLength: 300,
   // Projects to skip completely for now, written exactly as the project name
   // appears in the alert (capitals do not matter). Their digests are left out
   // of the alert, the daily summary and the sheet. Remove a name to start
   // watching that project again.
-  ignoredProjects: [],
-  // When a project sent more than one digest today, alert on its latest one
-  // only, so the same project does not appear twice. Set to false to include
-  // every digest.
+  ignoredProjects: ['US Food Import-US Food Imports'],
+  // When a project sent more than one digest in the window, alert on its
+  // latest one only, so the same project does not appear twice. Set to false
+  // to include every digest.
   onlyLatestDigestPerProject: true,
   dailySheetPrefix: 'Digest Summary - '
 });
@@ -189,15 +211,20 @@ const ALERT_SECTION_SEVERITY = Object.freeze({
   profilerAnomalies: 2
 });
 
-const ALERT_ICONS = Object.freeze({
-  3: ':red_circle:',
-  2: ':large_orange_circle:',
-  1: ':hourglass_flowing_sand:'
+/**
+ * The colored dot shown in the Status column, by severity:
+ * 3 = act now (red), 2 = worth a look (yellow), 1 = still running.
+ */
+const ALERT_EMOJI = Object.freeze({
+  3: 'red_circle',
+  2: 'large_yellow_circle',
+  1: 'hourglass_flowing_sand'
 });
 
 /**
- * Plain-language problem types. The label finishes the sentence "N reports ...".
- * Severity 3 = act now, 2 = worth a look.
+ * Problem types behind each report's status. Severity 3 = act now (red),
+ * 2 = worth a look (yellow). Rank only orders problems of the same severity,
+ * lower first.
  *
  * The rules are deliberately simple:
  *   Act now: a report with 0 records, a failed run, failed QA rules (the
@@ -205,80 +232,295 @@ const ALERT_ICONS = Object.freeze({
  *     digest's Failed tasks section).
  *   Worth a look: every count alert and fill rate alert the digest raises,
  *     whatever the size of the change, plus long running crawlers.
- * The far below normal and slightly below normal kinds only change the
- * wording. Both are worth a look.
  */
 const ISSUE_KINDS = Object.freeze({
-  noData:      { severity: 3, label: 'returned 0 records' },
-  runFailed:   { severity: 3, label: 'with a failed run' },
-  validation:  { severity: 3, label: 'failed QA rules' },
-  failedTasks: { severity: 3, label: 'with a failed child process' },
-  missedRun:   { severity: 3, label: 'missed their schedule' },
-  emptyFields: { severity: 2, label: 'with 0% fill rate' },
-  bigDrop:     { severity: 2, label: 'far below normal' },
-  smallDrop:   { severity: 2, label: 'slightly below normal' },
-  rise:        { severity: 2, label: 'above normal' },
-  lowFill:     { severity: 2, label: 'with low fill rate' },
-  slowRun:     { severity: 2, label: 'running long' },
-  anomaly:     { severity: 2, label: 'flagged as unusual' }
+  runFailed:   { severity: 3, rank: 1 },
+  noData:      { severity: 3, rank: 2 },
+  validation:  { severity: 3, rank: 3 },
+  failedTasks: { severity: 3, rank: 4 },
+  missedRun:   { severity: 3, rank: 5 },
+  emptyFields: { severity: 2, rank: 6 },
+  drop:        { severity: 2, rank: 7 },
+  lowFill:     { severity: 2, rank: 8 },
+  rise:        { severity: 2, rank: 9 },
+  countChange: { severity: 2, rank: 10 },
+  slowRun:     { severity: 2, rank: 11 },
+  anomaly:     { severity: 2, rank: 12 },
+  flagged:     { severity: 2, rank: 13 }
 });
 
 /**
- * Optional. Tag the person responsible for a project in its thread reply.
- * Key is the digest project name exactly as it appears in the alert, value is
- * the Slack member ID (profile > three dots > Copy member ID).
+ * Optional. Tag the person responsible for a project next to its name in the
+ * Project column. Key is the digest project name exactly as it appears in the
+ * digest subject, value is the Slack member ID (profile > three dots > Copy
+ * member ID).
  * Example: 'Defensoria Salud-Defensoria Salud': 'U0123ABCD'
  */
 const PROJECT_OWNERS = Object.freeze({
 });
 
 /**
- * Creates the triggers this script needs:
- *   1. monitorDigestAlerts: runs every alertCheckEveryMinutes. Nearly every run
- *      exits at once, because the script only posts at or after alertHour:
- *      alertMinute (in reportTimezone) and at most once per day.
- *   2. refreshDigestSheet: a silent hourly refresh of today's sheet tab so
- *      digests that arrive after the alert are still recorded for trends.
- *      Created only when CONFIG.trendCheckEnabled is true.
- * Add SLACK_BOT_TOKEN and SLACK_CHANNEL_ID under Project Settings > Script
- * properties first. Setup posts nothing to Slack; run postAlertThreadNow to
- * test the message. Running setup again replaces any older triggers.
+ * Name of the function the script books for each time in ALERT_TIMES. Only
+ * the script creates triggers on it; teams never add it by hand.
+ */
+const SCHEDULED_HANDLER = 'runScheduledAlert';
+
+/**
+ * Sets up the schedule. Run it once after pasting the code, and again after
+ * changing ALERT_TIMES. It posts nothing to Slack; read the execution log.
+ *
+ * With ALERT_TIMES in Script properties (for example 10:00, 13:00, 16:00):
+ * removes the triggers it booked before and books one one-time trigger per
+ * time, at the next occurrence of that time in reportTimezone. Each of those
+ * runs books the next day's trigger for its time, so the schedule keeps
+ * going on its own.
+ *
+ * Without ALERT_TIMES: books nothing. The team can then add its own Day
+ * timer triggers on monitorDigestAlerts in the Triggers page instead (each
+ * fires at some minute inside the chosen hour).
  */
 function setupMonitoring() {
-  // Throws with a clear message when the bot token or channel ID is missing.
-  getSlackBotConfig_();
+  const slack = getSlackBotConfig_();
+  const times = readAlertTimes_();
+  const properties = PropertiesService.getScriptProperties();
+  const triggers = ScriptApp.getProjectTriggers();
+  const manualTriggers = triggers.filter(function(trigger) {
+    return trigger.getHandlerFunction() === 'monitorDigestAlerts';
+  });
+  const refreshTriggers = triggers.filter(function(trigger) {
+    return trigger.getHandlerFunction() === 'refreshDigestSheet';
+  });
 
-  // Remove only this script's older triggers (including the old hourly alert)
-  // so nothing runs twice.
-  ScriptApp.getProjectTriggers()
-    .filter(function(trigger) {
-      const handler = trigger.getHandlerFunction();
+  // Start the schedule fresh: remove every trigger this script booked before.
+  triggers.filter(function(trigger) {
+    return trigger.getHandlerFunction() === SCHEDULED_HANDLER;
+  }).forEach(function(trigger) {
+    ScriptApp.deleteTrigger(trigger);
+  });
+  properties.deleteProperty(CONFIG.scheduleProperty);
 
-      return handler === 'monitorDigestAlerts' || handler === 'refreshDigestSheet';
-    })
-    .forEach(function(trigger) {
-      ScriptApp.deleteTrigger(trigger);
+  console.log('Slack: bot token found, %s channel(s): %s.',
+    slack.channels.length, slack.channels.join(', '));
+
+  if (times.length > 0) {
+    const booked = syncAlertSchedule_(null);
+    const next = Object.keys(booked).map(function(id) {
+      return booked[id];
+    }).sort(function(a, b) {
+      return a.at - b.at;
+    }).map(function(booking) {
+      return formatWindowTime_(booking.at);
     });
 
-  ScriptApp.newTrigger('monitorDigestAlerts')
-    .timeBased()
-    .everyMinutes(CONFIG.alertCheckEveryMinutes)
-    .create();
+    console.log('Alert times (%s): %s. Booked the next runs: %s.',
+      CONFIG.reportTimezone,
+      times.map(function(time) {
+        return time.text;
+      }).join(', '),
+      next.join(', '));
 
-  // The hourly refresh only feeds the trend check, so skip it when that is off.
-  if (CONFIG.trendCheckEnabled) {
-    ScriptApp.newTrigger('refreshDigestSheet')
+    if (manualTriggers.length > 0) {
+      console.log('WARNING: %s trigger(s) in the Triggers page also run monitorDigestAlerts. ' +
+        'With ALERT_TIMES set they are not needed and would post extra alerts. ' +
+        'Delete them in the Triggers page.', manualTriggers.length);
+    }
+  } else {
+    console.log('ALERT_TIMES is not set, so no run times were booked. Either add ALERT_TIMES ' +
+      'in Script properties (for example 10:00, 13:00, 16:00) and run setupMonitoring again, ' +
+      'or add Day timer triggers on monitorDigestAlerts in the Triggers page.');
+    console.log('%s trigger(s) in the Triggers page run monitorDigestAlerts. They use the ' +
+      'project time zone (%s).', manualTriggers.length, Session.getScriptTimeZone());
+  }
+
+  if (refreshTriggers.length > 0) {
+    console.log('%s old trigger(s) run refreshDigestSheet. They are no longer needed ' +
+      'and can be deleted in the Triggers page.', refreshTriggers.length);
+  }
+
+  console.log('The next run will cover digests received after %s.',
+    formatWindowTime_(resolveAlertWindow_(new Date()).start));
+}
+
+/**
+ * Reads ALERT_TIMES from Script properties: times separated by commas, such
+ * as "10:00, 13:00, 16:00" or "10am, 1pm, 4:30pm", in reportTimezone.
+ * Returns them sorted, without duplicates. Throws with a clear message when
+ * a time cannot be read.
+ */
+function readAlertTimes_() {
+  const raw = String(
+    PropertiesService.getScriptProperties().getProperty(CONFIG.alertTimesProperty) || ''
+  ).trim();
+  const seen = new Set();
+  const times = [];
+
+  raw.split(/[,;\n]+/).map(function(part) {
+    return part.trim();
+  }).filter(function(part) {
+    return part !== '';
+  }).forEach(function(part) {
+    const match = part.match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?$/i);
+    let hour = match ? Number(match[1]) : NaN;
+    const minute = match && match[2] ? Number(match[2]) : 0;
+    const suffix = match && match[3] ? match[3].toLowerCase() : '';
+
+    if (match && suffix && hour >= 1 && hour <= 12) {
+      hour = hour % 12 + (suffix === 'pm' ? 12 : 0);
+    } else if (match && suffix) {
+      hour = NaN;
+    }
+
+    if (!match || !(hour >= 0 && hour <= 23) || minute > 59 || (!suffix && !match[2])) {
+      throw new Error('ALERT_TIMES has "' + part + '". Write times like 10:00, 13:00, 16:00 ' +
+        '(or 10am, 1pm, 4pm), separated by commas.');
+    }
+
+    const text = ('0' + hour).slice(-2) + ':' + ('0' + minute).slice(-2);
+
+    if (!seen.has(text)) {
+      seen.add(text);
+      times.push({ text: text, hour: hour, minute: minute });
+    }
+  });
+
+  if (times.length > CONFIG.maximumAlertTimes) {
+    throw new Error('ALERT_TIMES has ' + times.length + ' times. Google allows about 20 ' +
+      'triggers per script, so use at most ' + CONFIG.maximumAlertTimes + '.');
+  }
+
+  return times.sort(function(a, b) {
+    return a.text.localeCompare(b.text);
+  });
+}
+
+/**
+ * The next moment a time happens, in reportTimezone, after fromMs (with a
+ * one minute margin so a run never books its own time again).
+ */
+function nextOccurrence_(time, fromMs) {
+  const todayKey = Utilities.formatDate(new Date(fromMs), CONFIG.reportTimezone, 'yyyy-MM-dd');
+  let at = localTimeToMilliseconds_(todayKey, time.hour, time.minute);
+
+  if (at <= fromMs + 60 * 1000) {
+    const tomorrowKey = Utilities.formatDate(
+      new Date(localTimeToMilliseconds_(todayKey, 12, 0) + 24 * 60 * 60 * 1000),
+      CONFIG.reportTimezone,
+      'yyyy-MM-dd'
+    );
+
+    at = localTimeToMilliseconds_(tomorrowKey, time.hour, time.minute);
+  }
+
+  return at;
+}
+
+/**
+ * Makes sure every time in ALERT_TIMES has exactly one upcoming one-time
+ * trigger, and nothing else is booked. firedTriggerId is the trigger that
+ * started this run (or null): it is removed, and the next day's trigger for
+ * its time is booked. Missing triggers are booked again, so one run repairs
+ * the whole schedule. Bookings are kept in the ALERT_SCHEDULE property as
+ * {"<trigger id>": {"time": "13:00", "at": 1759910000000}}.
+ */
+function syncAlertSchedule_(firedTriggerId) {
+  const properties = PropertiesService.getScriptProperties();
+  const times = readAlertTimes_();
+  const now = Date.now();
+  const wanted = new Set(times.map(function(time) {
+    return time.text;
+  }));
+  let bookings = {};
+
+  try {
+    bookings = JSON.parse(properties.getProperty(CONFIG.scheduleProperty) || '{}') || {};
+  } catch (error) {
+    bookings = {};
+  }
+
+  const fired = firedTriggerId ? bookings[firedTriggerId] : null;
+  const kept = {};
+  const covered = {};
+
+  ScriptApp.getProjectTriggers().filter(function(trigger) {
+    return trigger.getHandlerFunction() === SCHEDULED_HANDLER;
+  }).forEach(function(trigger) {
+    const id = trigger.getUniqueId();
+    const booking = bookings[id];
+    // A booking more than 10 minutes in the past never fired; replace it.
+    const keep = id !== firedTriggerId &&
+      booking && wanted.has(booking.time) && !covered[booking.time] &&
+      booking.at > now - 10 * 60 * 1000;
+
+    if (keep) {
+      kept[id] = booking;
+      covered[booking.time] = true;
+    } else {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  times.forEach(function(time) {
+    if (covered[time.text]) {
+      return;
+    }
+
+    // The time that just fired books its next day, even if it fired early.
+    const from = fired && fired.time === time.text ? Math.max(now, fired.at) : now;
+    const at = nextOccurrence_(time, from);
+    const trigger = ScriptApp.newTrigger(SCHEDULED_HANDLER)
       .timeBased()
-      .everyHours(1)
+      .at(new Date(at))
       .create();
 
-    refreshDigestSheet();
+    kept[trigger.getUniqueId()] = { time: time.text, at: at };
+  });
+
+  properties.setProperty(CONFIG.scheduleProperty, JSON.stringify(kept));
+
+  return kept;
+}
+
+/**
+ * Started by the one-time triggers booked from ALERT_TIMES. It books the
+ * next trigger FIRST, so the schedule continues even if posting fails, then
+ * runs the alert. Never add this function in the Triggers page by hand.
+ */
+function runScheduledAlert(event) {
+  const firedTriggerId = event && event.triggerUid ? String(event.triggerUid) : null;
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    // Another run is busy. Keep the schedule going; the next run's window
+    // includes everything this one would have posted.
+    syncAlertSchedule_(firedTriggerId);
+    console.log('Another run is still in progress. Skipping this one.');
+    return;
+  }
+
+  let scheduleError = null;
+
+  try {
+    try {
+      syncAlertSchedule_(firedTriggerId);
+    } catch (error) {
+      scheduleError = error;
+      console.log('Could not book the next run: %s', error.message);
+    }
+
+    runDigestAlert_();
+  } finally {
+    lock.releaseLock();
+  }
+
+  if (scheduleError) {
+    throw new Error('The alert was posted but the next run could not be booked: ' +
+      scheduleError.message + ' Fix ALERT_TIMES and run setupMonitoring again.');
   }
 }
 
 /**
  * Keeps one evaluation per project: the digest received last. A project can
- * send several digests in a day, and the latest shows its current state.
+ * send several digests in a window, and the latest shows its current state.
  */
 function latestDigestPerProject_(evaluations) {
   if (!CONFIG.onlyLatestDigestPerProject) {
@@ -301,11 +543,12 @@ function latestDigestPerProject_(evaluations) {
 }
 
 /**
- * Reads every digest received today, evaluates it against the sheet history
- * and rebuilds today's sheet tab. Posts nothing.
+ * Reads every digest in the alert window, evaluates it against the sheet
+ * history and adds the new digests to today's sheet tab. Posts nothing. When
+ * no window is passed, the current window (saved start to now) is used.
  */
-function buildTodaysEvaluations_(spreadsheet) {
-  const digests = loadCurrentDigests_();
+function buildTodaysEvaluations_(spreadsheet, alertWindow) {
+  const digests = loadCurrentDigests_(alertWindow);
   const sheetName = dailySheetName_(new Date());
   const sheetHistory = CONFIG.trendCheckEnabled
     ? loadHistoryFromDailySheets_(spreadsheet, sheetName)
@@ -327,8 +570,8 @@ function buildTodaysEvaluations_(spreadsheet) {
 }
 
 /**
- * Hourly and silent: keeps today's sheet tab current, including digests that
- * arrive after the daily alert. This tab is the history the trend checks use.
+ * Manual and silent: adds the digests of the current window to today's sheet
+ * tab without posting to Slack and without moving the saved window.
  */
 function refreshDigestSheet() {
   const snapshot = buildTodaysEvaluations_(getBoundSpreadsheet_());
@@ -337,57 +580,157 @@ function refreshDigestSheet() {
 }
 
 /**
- * Reads which channels already received today's alert. The state is stored as
- * {"date": "2026-09-28", "channels": ["C0123ABCD9"]} and starts fresh each day.
+ * Reads LAST_ALERT_STATE, which holds where the next window starts:
+ *   {"windowStart": 1759900000000,
+ *    "channels": {"C0123ABCD9": 1759900000000},
+ *    "windowStartText": "2026-10-08 16:00", "time": "2026-10-08 16:05:12"}
+ * "channels" has one start per Slack channel, so a channel whose post failed
+ * keeps its older start. "windowStart" is used for a channel with no entry,
+ * such as one just added to SLACK_CHANNEL_ID. The two text fields are only
+ * for reading in Script properties.
+ *
+ * A state saved by the old once-a-day version ({"date": "2026-10-08",
+ * "channels": [...]}) is read as "start at that day's legacyAlertHour:
+ * legacyAlertMinute", so the first run after upgrading does not post again
+ * what the old version already posted.
  */
-function readAlertState_(properties, today) {
+function readAlertState_() {
   let state = null;
 
   try {
-    state = JSON.parse(properties.getProperty(CONFIG.lastAlertProperty) || 'null');
+    state = JSON.parse(
+      PropertiesService.getScriptProperties().getProperty(CONFIG.lastAlertProperty) || 'null'
+    );
   } catch (error) {
     state = null;
   }
 
-  if (!state || state.date !== today || !Array.isArray(state.channels)) {
-    return { date: today, channels: [], done: false };
+  if (!state || typeof state !== 'object') {
+    return { windowStart: null, channels: {} };
   }
 
-  state.done = state.done === true;
+  if (Number.isFinite(state.windowStart)) {
+    const channels = {};
 
-  return state;
+    if (state.channels && typeof state.channels === 'object' && !Array.isArray(state.channels)) {
+      Object.keys(state.channels).forEach(function(channel) {
+        if (Number.isFinite(state.channels[channel])) {
+          channels[channel] = state.channels[channel];
+        }
+      });
+    }
+
+    return { windowStart: state.windowStart, channels: channels };
+  }
+
+  if (typeof state.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(state.date)) {
+    return {
+      windowStart: localTimeToMilliseconds_(state.date, CONFIG.legacyAlertHour, CONFIG.legacyAlertMinute),
+      channels: {}
+    };
+  }
+
+  return { windowStart: null, channels: {} };
 }
 
 /**
- * True once the local time in reportTimezone is at or after the configured
- * alert time. The check is made by the script, not by the trigger schedule.
+ * Saves where the next window starts: one start per channel, plus the start
+ * for channels that have none yet.
  */
-function isAlertTimeReached_(now) {
-  const hour = parseInt(Utilities.formatDate(now, CONFIG.reportTimezone, 'H'), 10);
-  const minute = parseInt(Utilities.formatDate(now, CONFIG.reportTimezone, 'm'), 10);
-
-  return hour * 60 + minute >= CONFIG.alertHour * 60 + CONFIG.alertMinute;
+function saveAlertState_(properties, windowStart, channelStarts, now) {
+  properties.setProperty(CONFIG.lastAlertProperty, JSON.stringify({
+    windowStart: windowStart,
+    channels: channelStarts,
+    windowStartText: formatWindowTime_(windowStart),
+    time: Utilities.formatDate(now, CONFIG.reportTimezone, 'yyyy-MM-dd HH:mm:ss')
+  }));
 }
 
 /**
- * Posts the alert to each channel: its own main message and its own threads.
- * A channel counts as posted once its main message is up. Failures are
- * collected, so one broken channel never stops the others.
+ * End of the window for a run starting now: a few minutes before now
+ * (digestSettleMinutes), so very recent digests wait for the next run.
  */
-function postAlertToChannels_(slack, channels, models, sheetUrl) {
+function windowEndFor_(now) {
+  return now.getTime() - CONFIG.digestSettleMinutes * 60 * 1000;
+}
+
+/**
+ * Where a channel's window starts: its own saved start, else the shared one,
+ * else firstRunLookbackHours before the end. Never older than
+ * maximumWindowHours and never after the end.
+ */
+function channelWindowStart_(state, channel, end) {
+  let start = state.channels[channel];
+
+  if (!Number.isFinite(start)) {
+    start = state.windowStart;
+  }
+
+  if (!Number.isFinite(start)) {
+    start = end - CONFIG.firstRunLookbackHours * 60 * 60 * 1000;
+  }
+
+  start = Math.max(start, end - CONFIG.maximumWindowHours * 60 * 60 * 1000);
+
+  return Math.min(start, end);
+}
+
+/**
+ * The current window, read only, for helpers: from the earliest channel
+ * start to the end. Changes nothing.
+ */
+function resolveAlertWindow_(now) {
+  const end = windowEndFor_(now);
+  const state = readAlertState_();
+  let channels = [];
+
+  try {
+    channels = getSlackBotConfig_().channels;
+  } catch (error) {
+    channels = [];
+  }
+
+  const starts = (channels.length > 0 ? channels : ['']).map(function(channel) {
+    return channelWindowStart_(state, channel, end);
+  });
+
+  return { start: Math.min.apply(null, starts), end: end };
+}
+
+/**
+ * Formats an epoch ms value as a local date and time for logs.
+ */
+function formatWindowTime_(milliseconds) {
+  return Utilities.formatDate(new Date(milliseconds), CONFIG.reportTimezone, 'yyyy-MM-dd HH:mm');
+}
+
+/**
+ * Epoch ms of a local date ("2026-10-07") and time in reportTimezone.
+ */
+function localTimeToMilliseconds_(dateKey, hour, minute) {
+  const dayStart = startOfToday_(
+    new Date(Date.parse(dateKey + 'T12:00:00Z')),
+    CONFIG.reportTimezone
+  ).getTime();
+
+  return dayStart + (Number(hour) * 60 + Number(minute)) * 60 * 1000;
+}
+
+/**
+ * Posts the alert to each channel. A channel counts as posted once the first
+ * message is up. Failures are collected, so one broken channel never stops
+ * the others.
+ */
+function postAlertToChannels_(slack, channels, models) {
   const result = { posted: [], errors: [] };
 
   channels.forEach(function(channel) {
     try {
-      const outcome = postAlertThread_(
-        { token: slack.token, channel: channel },
-        models,
-        sheetUrl
-      );
+      const outcome = postAlertMessage_({ token: slack.token, channel: channel }, models);
 
       result.posted.push(channel);
       outcome.errors.forEach(function(message) {
-        result.errors.push(channel + ' thread reply: ' + message);
+        result.errors.push(channel + ': ' + message);
       });
     } catch (error) {
       result.errors.push(channel + ': ' + error.message);
@@ -398,80 +741,113 @@ function postAlertToChannels_(slack, channels, models, sheetUrl) {
 }
 
 /**
- * The daily alert. Runs on a frequent trigger but does nothing before
- * alertHour:alertMinute. From then on it covers every digest received so far
- * today and posts to every channel in SLACK_CHANNEL_ID at most once per day.
- * A channel that failed is tried again on the next run without repeating the
- * ones that worked. If nothing needs attention it posts nothing and does not
- * look again that day. To post by hand at any time, run postAlertThreadNow.
+ * The function for Day timer triggers added by hand in the Triggers page
+ * (only needed when ALERT_TIMES is not used). Every run posts. A script lock
+ * stops two runs from overlapping, which would read the same window twice.
+ * To post by hand at any time, run postAlertThreadNow.
  */
 function monitorDigestAlerts() {
-  const properties = PropertiesService.getScriptProperties();
-  const now = new Date();
+  const lock = LockService.getScriptLock();
 
-  if (!isAlertTimeReached_(now)) {
-    console.log('Before %s:%s in %s. Nothing to do yet.',
-      CONFIG.alertHour, ('0' + CONFIG.alertMinute).slice(-2), CONFIG.reportTimezone);
+  if (!lock.tryLock(30000)) {
+    console.log('Another run is still in progress. Skipping this one.');
     return;
   }
 
-  const slack = getSlackBotConfig_();
-  const today = Utilities.formatDate(now, CONFIG.reportTimezone, 'yyyy-MM-dd');
-  const state = readAlertState_(properties, today);
-  const pendingChannels = slack.channels.filter(function(channel) {
-    return state.channels.indexOf(channel) === -1;
-  });
-
-  if (state.done || pendingChannels.length === 0) {
-    console.log('Already handled the alert for %s. Skipping.', today);
-    return;
+  try {
+    runDigestAlert_();
+  } finally {
+    lock.releaseLock();
   }
+}
 
-  const spreadsheet = getBoundSpreadsheet_();
-  const snapshot = buildTodaysEvaluations_(spreadsheet);
-  const alertingEvaluations = latestDigestPerProject_(snapshot.evaluations)
+/**
+ * Today's alert models from a list of evaluations: the latest digest per
+ * project, only those that need attention, worst first.
+ */
+function buildAlertModels_(evaluations) {
+  return latestDigestPerProject_(evaluations)
     .filter(function(item) {
       return item.result.shouldAlert;
-    });
-
-  if (alertingEvaluations.length === 0) {
-    state.done = true;
-    properties.setProperty(CONFIG.lastAlertProperty, JSON.stringify(state));
-    console.log('Checked %s digest(s). Nothing needs attention, so no alert was posted.',
-      snapshot.evaluations.length);
-    return;
-  }
-
-  const models = alertingEvaluations
+    })
     .map(function(item) {
       return buildProjectAlertModel_(item);
     })
     .sort(compareAlertModels_);
+}
 
-  const outcome = postAlertToChannels_(
-    slack,
-    pendingChannels,
-    models,
-    alertSheetUrl_(spreadsheet, snapshot.sheetName)
-  );
+/**
+ * One run: reads the digests since the earliest channel start, adds them to
+ * today's sheet and posts to each channel the flagged digests of its own
+ * window. A channel's start moves to this window's end when it received the
+ * alert or when nothing needed attention. A channel whose post failed keeps
+ * its start, so the next run covers those digests again for it.
+ */
+function runDigestAlert_() {
+  const properties = PropertiesService.getScriptProperties();
+  const now = new Date();
+  const slack = getSlackBotConfig_();
+  const end = windowEndFor_(now);
+  const state = readAlertState_();
+  const starts = {};
 
-  if (outcome.posted.length > 0) {
-    outcome.posted.forEach(function(channel) {
-      state.channels.push(channel);
+  slack.channels.forEach(function(channel) {
+    starts[channel] = channelWindowStart_(state, channel, end);
+  });
+
+  const earliest = Math.min.apply(null, slack.channels.map(function(channel) {
+    return starts[channel];
+  }));
+  const spreadsheet = getBoundSpreadsheet_();
+  const snapshot = buildTodaysEvaluations_(spreadsheet, { start: earliest, end: end });
+
+  // Channels with the same start get the same alert, posted once per channel.
+  const groups = new Map();
+
+  slack.channels.forEach(function(channel) {
+    if (!groups.has(starts[channel])) {
+      groups.set(starts[channel], []);
+    }
+
+    groups.get(starts[channel]).push(channel);
+  });
+
+  const nextStarts = {};
+  const errors = [];
+  const summaries = [];
+
+  groups.forEach(function(channels, start) {
+    const windowText = formatWindowTime_(start) + ' to ' + formatWindowTime_(end);
+    const models = buildAlertModels_(snapshot.evaluations.filter(function(item) {
+      return item.digest.receivedAt.getTime() > start;
+    }));
+
+    if (models.length === 0) {
+      channels.forEach(function(channel) {
+        nextStarts[channel] = end;
+      });
+      summaries.push(windowText + ': nothing needs attention.');
+      return;
+    }
+
+    const outcome = postAlertToChannels_(slack, channels, models);
+
+    channels.forEach(function(channel) {
+      nextStarts[channel] = outcome.posted.indexOf(channel) !== -1 ? end : start;
     });
+    outcome.errors.forEach(function(message) {
+      errors.push(message);
+    });
+    summaries.push(windowText + ': ' + models.length + ' project(s) posted to ' +
+      outcome.posted.length + ' of ' + channels.length + ' channel(s).');
+  });
 
-    properties.setProperty(CONFIG.lastAlertProperty, JSON.stringify(state));
-  }
+  saveAlertState_(properties, end, nextStarts, now);
+  console.log('Checked %s digest(s). %s', snapshot.evaluations.length, summaries.join(' '));
 
-  console.log('Checked %s digest(s). Posted the alert for %s project(s) to %s channel(s); %s problem(s).',
-    snapshot.evaluations.length,
-    models.length,
-    outcome.posted.length,
-    outcome.errors.length
-  );
-
-  if (outcome.errors.length > 0) {
-    throw new Error('Some alert posts failed: ' + outcome.errors.join(' | '));
+  if (errors.length > 0) {
+    throw new Error('Some alert posts failed: ' + errors.join(' | ') +
+      '. A channel that got nothing will get these digests on the next run.');
   }
 }
 
@@ -489,14 +865,18 @@ function isIgnoredProject_(projectName) {
 }
 
 /**
- * Loads only digest messages received within the exact rolling 24-hour window.
+ * Loads only digest messages received inside the alert window. When no
+ * window is passed, the current one (saved start to now) is used without
+ * changing anything.
  */
-function loadCurrentDigests_() {
-  const runStartedAt = new Date();
-  const windowStart = digestWindowStart_(runStartedAt);
-  const now = runStartedAt.getTime();
+function loadCurrentDigests_(alertWindow) {
+  const range = alertWindow || resolveAlertWindow_(new Date());
+  // Gmail's after: is only a rough pre-filter (1 hour margin). The exact
+  // cut is made per message in isWithinCurrentWindow_.
+  const afterSeconds = Math.floor((range.start - 60 * 60 * 1000) / 1000);
+  const query = CONFIG.currentGmailQuery + ' after:' + afterSeconds;
 
-  return getDigestMessages_(CONFIG.currentGmailQuery, windowStart, now)
+  return getDigestMessages_(query, range.start, range.end)
     .map(parseDigestMessage_)
     .filter(function(digest) {
       return digest !== null && !isIgnoredProject_(digest.projectName);
@@ -504,19 +884,6 @@ function loadCurrentDigests_() {
     .sort(function(a, b) {
       return a.receivedAt.getTime() - b.receivedAt.getTime();
     });
-}
-
-/**
- * Start of the digest window in milliseconds: today's alert time (alertHour:
- * alertMinute in reportTimezone) minus windowHours. Anchoring to the alert time
- * instead of "now" means a run at 10:34 today and one at 10:41 tomorrow still
- * join up with no gap between them.
- */
-function digestWindowStart_(now) {
-  const dayStart = startOfToday_(now, CONFIG.reportTimezone).getTime();
-  const alertTime = dayStart + (CONFIG.alertHour * 60 + CONFIG.alertMinute) * 60 * 1000;
-
-  return alertTime - CONFIG.windowHours * 60 * 60 * 1000;
 }
 
 /**
@@ -557,18 +924,20 @@ function timezoneOffsetMinutes_(offsetText) {
 }
 
 /**
- * Accepts only messages from local midnight through the current run time.
+ * Accepts only messages after the window start (exclusive) up to and
+ * including the window end, so a digest on the boundary belongs to exactly
+ * one window.
  */
-function isWithinCurrentWindow_(receivedAt, windowStart, now) {
+function isWithinCurrentWindow_(receivedAt, windowStart, windowEnd) {
   const receivedTime = receivedAt.getTime();
 
-  return receivedTime >= windowStart && receivedTime <= now;
+  return receivedTime > windowStart && receivedTime <= windowEnd;
 }
 
 /**
  * Loads matching Gmail messages in batches so multiple projects are supported.
  */
-function getDigestMessages_(gmailQuery, windowStart, now) {
+function getDigestMessages_(gmailQuery, windowStart, windowEnd) {
   const messages = [];
   const batchSize = 100;
 
@@ -578,7 +947,7 @@ function getDigestMessages_(gmailQuery, windowStart, now) {
     threads.forEach(function(thread) {
       thread.getMessages().forEach(function(message) {
         // Check the timestamp before reading the subject or body of the email.
-        if (!isWithinCurrentWindow_(message.getDate(), windowStart, now)) {
+        if (!isWithinCurrentWindow_(message.getDate(), windowStart, windowEnd)) {
           return;
         }
 
@@ -697,7 +1066,7 @@ function parseMetricRows_(html) {
     return {
       project: cells[1].text,
       report: cells[2].text,
-      reportUrl: cells[2].href,
+      reportUrl: cells[2].href || rowLink_(cells, [1]),
       currentCount: countPair.current,
       displayedAverageCount: countPair.average,
       displayedCountDiff: parseNumber_(cells[4].text),
@@ -794,6 +1163,10 @@ function parseSectionRows_(sectionHtml, section) {
         }
       }
     });
+
+    if (!detail.reportUrl) {
+      detail.reportUrl = rowLink_(cells, [section.columns.indexOf('project') + 1]);
+    }
 
     return detail.report ? detail : null;
   }).filter(function(detail) {
@@ -931,17 +1304,31 @@ function isYellowRgb_(red, green, blue) {
 }
 
 /**
+ * The first web link anywhere in a row, skipping the given cell positions
+ * (the project column), for rows whose report cell has no link of its own.
+ */
+function rowLink_(cells, skipIndexes) {
+  const cell = cells.find(function(item, index) {
+    return skipIndexes.indexOf(index) === -1 && /^https?:\/\//i.test(item.href);
+  });
+
+  return cell ? cell.href : '';
+}
+
+/**
  * Extracts visible text and the first link from every table cell.
  */
 function extractCells_(rowHtml) {
   const cellHtmlList = rowHtml.match(/<(?:td|th)\b[\s\S]*?<\/(?:td|th)>/gi) || [];
 
   return cellHtmlList.map(function(cellHtml) {
-    const hrefMatch = cellHtml.match(/<a\b[^>]*href=["']([^"']+)["']/i);
+    // Quoted or unquoted href, in any position inside the <a> tag.
+    const hrefMatch = cellHtml.match(/<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    const href = hrefMatch ? (hrefMatch[1] || hrefMatch[2] || hrefMatch[3] || '') : '';
 
     return {
       text: normalizeText_(htmlToText_(cellHtml)),
-      href: hrefMatch ? decodeHtml_(hrefMatch[1]) : ''
+      href: decodeHtml_(href).trim()
     };
   });
 }
@@ -1026,7 +1413,7 @@ function getBoundSpreadsheet_() {
 }
 
 /**
- * Builds the daily tab name using the spreadsheet timezone.
+ * Builds the daily tab name using the report timezone.
  */
 function dailySheetName_(date) {
   const dateKey = Utilities.formatDate(
@@ -1060,7 +1447,7 @@ function loadHistoryFromDailySheets_(spreadsheet, currentSheetName) {
     }
 
     readHistoryDigestsFromSheet_(sheet).forEach(function(digest) {
-      // The rolling window may place one message on two tabs so deduplicate it.
+      // A message may appear on two tabs so deduplicate it.
       digestsById.set(digest.messageId, digest);
     });
   });
@@ -1168,7 +1555,9 @@ function sheetBoolean_(value) {
 }
 
 /**
- * Creates or rebuilds today's report tab with one row per parsed report.
+ * Creates today's report tab if needed and APPENDS one row per parsed report.
+ * Digests already on the tab (matched by Message ID) are skipped, so several
+ * runs in one day add to the tab instead of wiping each other.
  */
 function writeDailySummarySheet_(spreadsheet, sheetName, evaluations) {
   let sheet = spreadsheet.getSheetByName(sheetName);
@@ -1181,38 +1570,50 @@ function writeDailySummarySheet_(spreadsheet, sheetName, evaluations) {
     sheet.getFilter().remove();
   }
 
-  sheet.clear();
-
-  const rows = buildSummaryRows_(evaluations);
-  const output = [SUMMARY_HEADERS.slice()].concat(rows);
-  const outputRange = sheet.getRange(1, 1, output.length, SUMMARY_HEADERS.length);
-
-  // Add checkbox validation before writing values so true states are preserved.
-  if (rows.length > 0) {
-    sheet.getRange(2, 15, rows.length, 1).insertCheckboxes();
-    sheet.getRange(2, 16, rows.length, 1).insertCheckboxes();
-    sheet.getRange(2, 19, rows.length, 1).insertCheckboxes();
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, SUMMARY_HEADERS.length).setValues([SUMMARY_HEADERS.slice()]);
+    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, SUMMARY_HEADERS.length)
+      .setFontWeight('bold')
+      .setFontColor('#ffffff')
+      .setBackground('#1f4e78');
   }
 
-  outputRange.setValues(output);
-  sheet.setFrozenRows(1);
-  sheet.getRange(1, 1, 1, SUMMARY_HEADERS.length)
-    .setFontWeight('bold')
-    .setFontColor('#ffffff')
-    .setBackground('#1f4e78');
+  // Skip digests already written by an earlier run today.
+  const idIndex = SUMMARY_HEADERS.indexOf('Message ID');
+  const knownIds = new Set();
 
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
-    sheet.getRange(2, 6, rows.length, 2).setNumberFormat('#,##0.00');
-    sheet.getRange(2, 8, rows.length, 1).setNumberFormat('0.00"%"');
-    sheet.getRange(2, 9, rows.length, 2).setNumberFormat('0.00');
-    sheet.getRange(2, 11, rows.length, 1).setNumberFormat('0.00"%"');
-    sheet.getRange(2, 12, rows.length, 1).setNumberFormat('#,##0');
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, idIndex + 1, sheet.getLastRow() - 1, 1).getValues()
+      .forEach(function(row) {
+        knownIds.add(String(row[0]));
+      });
   }
 
+  const rows = buildSummaryRows_(evaluations).filter(function(row) {
+    return !knownIds.has(String(row[idIndex]));
+  });
+
   if (rows.length > 0) {
-    outputRange.createFilter();
+    const first = sheet.getLastRow() + 1;
+
+    // Add checkbox validation before writing values so true states are preserved.
+    sheet.getRange(first, 15, rows.length, 1).insertCheckboxes();
+    sheet.getRange(first, 16, rows.length, 1).insertCheckboxes();
+    sheet.getRange(first, 19, rows.length, 1).insertCheckboxes();
+    sheet.getRange(first, 1, rows.length, SUMMARY_HEADERS.length).setValues(rows);
+    sheet.getRange(first, 1, rows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    sheet.getRange(first, 6, rows.length, 2).setNumberFormat('#,##0.00');
+    sheet.getRange(first, 8, rows.length, 1).setNumberFormat('0.00"%"');
+    sheet.getRange(first, 9, rows.length, 2).setNumberFormat('0.00');
+    sheet.getRange(first, 11, rows.length, 1).setNumberFormat('0.00"%"');
+    sheet.getRange(first, 12, rows.length, 1).setNumberFormat('#,##0');
   }
+
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(1, 1, sheet.getLastRow(), SUMMARY_HEADERS.length).createFilter();
+  }
+
   sheet.autoResizeColumns(1, SUMMARY_HEADERS.length);
   sheet.setColumnWidth(4, 220);
   sheet.setColumnWidth(5, 260);
@@ -1468,23 +1869,62 @@ function latestDailyRowsForReport_(currentRow, history) {
 
 /**
  * Sorts alert models: act now first, then worth a look, then still running.
+ * Inside each group the project with the most red reports comes first, then
+ * the most yellow, then the most still running, then by name.
  */
 function compareAlertModels_(a, b) {
   return b.severity - a.severity ||
+    b.counts[3] - a.counts[3] ||
+    b.counts[2] - a.counts[2] ||
+    b.counts[1] - a.counts[1] ||
     String(a.projectName).localeCompare(String(b.projectName));
 }
 
 /**
- * Turns one alerting digest into a plain-language model: a merged list of
- * affected reports (one line per report) plus a one-line project summary.
+ * Turns one alerting digest into the model behind its table rows: one item
+ * per affected report, the reports still running that have no other
+ * problem, and how many reports are red, yellow and still running. Each
+ * report is counted once, under its worst color.
  */
 function buildProjectAlertModel_(evaluation) {
   const digest = evaluation.digest;
   const result = evaluation.result;
   const items = buildAlertItems_(digest, result);
-  const processing = result.processingRows.map(function(row) {
-    return { report: row.report, reportUrl: row.reportUrl };
+  const itemsByKey = new Map(items.map(function(item) {
+    return [item.key, item];
+  }));
+  const processing = [];
+  const seenProcessing = new Set();
+
+  result.processingRows.forEach(function(row) {
+    const report = normalizeText_(row.report);
+    const key = report.toLowerCase();
+
+    if (itemsByKey.has(key)) {
+      // The report has a problem from an earlier run and a new run had started.
+      itemsByKey.get(key).running = true;
+    } else if (report && !seenProcessing.has(key)) {
+      seenProcessing.add(key);
+      processing.push({ report: report, reportUrl: row.reportUrl || '' });
+    }
   });
+
+  // A report can appear in several tables of the digest and only some of them
+  // link it, so take its link from whichever table has one.
+  const links = reportLinksByName_(digest);
+
+  items.forEach(function(item) {
+    if (!/^https?:\/\//i.test(item.reportUrl)) {
+      item.reportUrl = links.get(item.key) || item.reportUrl;
+    }
+  });
+
+  processing.forEach(function(row) {
+    if (!/^https?:\/\//i.test(row.reportUrl)) {
+      row.reportUrl = links.get(normalizeText_(row.report).toLowerCase()) || row.reportUrl;
+    }
+  });
+
   // Safety net: the digest shows a section count but no detail could be read.
   const unexplained = items.length === 0 ? result.activeSections : [];
   let severity = items.reduce(function(highest, item) {
@@ -1499,18 +1939,18 @@ function buildProjectAlertModel_(evaluation) {
     severity = processing.length > 0 ? 1 : 2;
   }
 
-  let summary = 'flagged in the digest, see the sheet';
+  const counts = { 3: 0, 2: 0, 1: processing.length };
 
-  if (items.length > 0) {
-    summary = summarizeIssueKinds_(items);
-  } else if (unexplained.length > 0) {
-    summary = unexplained.map(function(section) {
-      return section.label + ' (' + digest.sectionCounts[section.key] + ')';
-    }).join(', ') + ', details could not be read, see the sheet';
-  } else if (processing.length > 0) {
-    summary = processing.slice(0, 3).map(slackReportLink_).join(', ') +
-      (processing.length > 3 ? ', +' + (processing.length - 3) + ' more' : '') +
-      ' still running';
+  items.forEach(function(item) {
+    counts[item.severity]++;
+  });
+
+  unexplained.forEach(function(section) {
+    counts[ALERT_SECTION_SEVERITY[section.key] || 2] += digest.sectionCounts[section.key] || 1;
+  });
+
+  if (counts[3] + counts[2] + counts[1] === 0) {
+    counts[severity] = 1;
   }
 
   return {
@@ -1520,82 +1960,186 @@ function buildProjectAlertModel_(evaluation) {
     items: items,
     processing: processing,
     unexplained: unexplained,
-    summary: summary,
-    // Projects that are only "still running" get a line in the main message
-    // but no thread reply, because there is nothing to explain.
-    hasThread: items.length > 0 || unexplained.length > 0 ||
-      (processing.length === 0)
+    counts: counts
   };
 }
 
 /**
- * Merges every finding for a digest into one item per report.
+ * Every report link found in a digest, by lowercase report name: the main
+ * table first, then the other tables (failed runs, data validation, ...).
+ */
+function reportLinksByName_(digest) {
+  const links = new Map();
+  const add = function(row) {
+    const key = normalizeText_(row.report).toLowerCase();
+    const url = String(row.reportUrl || '').trim();
+
+    if (key && /^https?:\/\//i.test(url) && !links.has(key)) {
+      links.set(key, url);
+    }
+  };
+
+  digest.rows.forEach(add);
+  Object.keys(digest.alertDetails || {}).forEach(function(key) {
+    (digest.alertDetails[key] || []).forEach(add);
+  });
+
+  return links;
+}
+
+/**
+ * Collects every finding for a digest into one item per report.
  */
 function buildAlertItems_(digest, result) {
   const byReport = new Map();
 
-  const add = function(row, description) {
+  const add = function(row, findings, redundantIfFlagged) {
     const report = normalizeText_(row.report);
 
-    if (!report) {
+    if (!report || findings.length === 0) {
       return;
     }
 
     const key = report.toLowerCase();
     const existing = byReport.get(key);
-    const severity = ISSUE_KINDS[description.kind].severity;
+    const severity = findings.reduce(function(highest, finding) {
+      return Math.max(highest, ISSUE_KINDS[finding.kind].severity);
+    }, 0);
 
     if (!existing) {
       byReport.set(key, {
         report: report,
+        key: key,
         reportUrl: row.reportUrl || '',
         severity: severity,
-        kind: description.kind,
-        texts: description.text ? [description.text] : []
+        findings: findings.slice(),
+        running: false
       });
       return;
     }
 
     // Already explained by the flagged row, so do not say it twice.
-    if (description.redundantIfFlagged) {
+    if (redundantIfFlagged) {
       return;
     }
 
-    if (severity > existing.severity) {
-      existing.severity = severity;
-      existing.kind = description.kind;
-    }
+    existing.severity = Math.max(existing.severity, severity);
 
     if (!existing.reportUrl && row.reportUrl) {
       existing.reportUrl = row.reportUrl;
     }
 
-    if (description.text && existing.texts.indexOf(description.text) === -1) {
-      existing.texts.push(description.text);
-    }
+    findings.forEach(function(finding) {
+      existing.findings.push(finding);
+    });
   };
 
   result.flaggedRows.forEach(function(row) {
-    add(row, describeFlaggedRow_(row));
+    add(row, describeFlaggedRow_(row), false);
   });
 
   result.trendAlerts.forEach(function(alert) {
-    add(alert.row, describeTrendAlert_(alert));
+    add(alert.row, describeTrendAlert_(alert), false);
   });
 
   ALERT_SECTIONS.forEach(function(section) {
     (result.alertDetails[section.key] || []).forEach(function(detail) {
-      add(detail, describeSectionDetail_(section.key, detail));
+      const finding = describeSectionDetail_(section.key, detail);
+
+      add(detail, [{ kind: finding.kind, text: finding.text }], finding.redundantIfFlagged === true);
     });
   });
 
   return Array.from(byReport.values()).sort(function(a, b) {
-    return b.severity - a.severity || a.report.localeCompare(b.report);
+    return b.severity - a.severity ||
+      itemTopRank_(a) - itemTopRank_(b) ||
+      a.report.localeCompare(b.report);
   });
 }
 
 /**
- * Explains a flagged report row in everyday words.
+ * The findings shown for a report: only those of its worst color. A report
+ * that is red shows its red problems only, so "up 2%" never sits next to a
+ * failed run. Everything else is still in the sheet.
+ */
+function itemShownFindings_(item) {
+  return item.findings
+    .filter(function(finding) {
+      return ISSUE_KINDS[finding.kind].severity === item.severity;
+    })
+    .sort(function(a, b) {
+      return ISSUE_KINDS[a.kind].rank - ISSUE_KINDS[b.kind].rank;
+    });
+}
+
+/**
+ * Rank of the first problem shown for a report, used to keep reports with the
+ * same problem next to each other in the table.
+ */
+function itemTopRank_(item) {
+  const shown = itemShownFindings_(item);
+
+  return shown.length > 0 ? ISSUE_KINDS[shown[0].kind].rank : 99;
+}
+
+/**
+ * The problem in a few words, such as "Run failed, QA failed" or
+ * "0 records, new run started". Not shown in the table for now (the Status
+ * column shows only the color); kept for previews and a later layout.
+ */
+function itemIssueText_(item) {
+  const texts = [];
+
+  itemShownFindings_(item).forEach(function(finding) {
+    if (texts.indexOf(finding.text) === -1) {
+      texts.push(finding.text);
+    }
+  });
+
+  if (texts.length === 0) {
+    texts.push('Needs a look');
+  }
+
+  if (item.running) {
+    texts.push('new run started');
+  }
+
+  return texts.join(', ');
+}
+
+/**
+ * "2,108 records, usually 2,124". The usual number is the average shown in
+ * the digest.
+ */
+function countVersusUsualText_(count, average) {
+  const usual = Math.round(Number(average) || 0);
+  let text = formatNumber_(count) + (Number(count) === 1 ? ' record' : ' records');
+
+  if (usual > 0) {
+    text += ', usually ' + formatNumber_(usual);
+  }
+
+  return text;
+}
+
+/**
+ * "Fill rate 19%, usually 80%".
+ */
+function fillVersusUsualText_(fill, average) {
+  const usual = Math.round(Number(average) || 0);
+  let text = 'Fill rate ' + Math.round(Number(fill) || 0) + '%';
+
+  if (usual > 0) {
+    text += ', usually ' + usual + '%';
+  }
+
+  return text;
+}
+
+/**
+ * Splits a flagged report row into separate findings, one fact each: its
+ * record count and its fill rate. A row with 0 records is red; every other
+ * flagged row is yellow, exactly as before.
  */
 function describeFlaggedRow_(row) {
   const comment = String(row.comment || '').toUpperCase();
@@ -1603,81 +2147,64 @@ function describeFlaggedRow_(row) {
   const flagsFill = comment.indexOf('FILL') !== -1 && !fillNotApplicable;
   const flagsCount = comment.indexOf('COUNT') !== -1 || !flagsFill;
   const count = Number(row.currentCount) || 0;
-  const usual = Math.round(Number(row.displayedAverageCount) || 0);
   const diff = row.displayedCountDiff;
   const fill = Number(row.currentFillRate) || 0;
-  let kind = 'lowFill';
+  const findings = [];
 
   if (count === 0) {
-    kind = 'noData';
-  } else if (fill === 0 && !fillNotApplicable) {
-    kind = 'emptyFields';
-  } else if (flagsCount && diff !== null && diff < 0) {
-    // Tiny reports swing a lot in percentage terms, so they stay orange.
-    kind = diff <= -CONFIG.bigDropPercent && usual >= CONFIG.minimumUsualForRed
-      ? 'bigDrop'
-      : 'smallDrop';
-  } else if (flagsCount && diff !== null && diff > 0) {
-    kind = 'rise';
-  }
+    findings.push({ kind: 'noData', text: '0 records' });
+  } else if (flagsCount) {
+    let kind = 'countChange';
 
-  const parts = [];
-
-  if (flagsCount || count === 0) {
-    let countText = formatNumber_(count) + (count === 1 ? ' record' : ' records') + ' today';
-
-    if (usual > 0) {
-      countText += ' vs ~' + formatNumber_(usual) + ' usual';
+    if (diff !== null && diff < 0) {
+      kind = 'drop';
+    } else if (diff !== null && diff > 0) {
+      kind = 'rise';
     }
 
-    if (count > 0 && diff !== null && diff !== 0) {
-      countText += ' (' + (diff < 0 ? 'down ' : 'up ') + Math.abs(diff).toFixed(0) + '%)';
-    }
-
-    parts.push(countText);
+    findings.push({
+      kind: kind,
+      text: countVersusUsualText_(count, row.displayedAverageCount)
+    });
   }
 
   if (count > 0 && fill === 0 && !fillNotApplicable) {
-    parts.push('fill rate 0%');
+    findings.push({ kind: 'emptyFields', text: 'Fill rate 0%' });
   } else if (count > 0 && flagsFill && fill < 100) {
-    parts.push('fill rate ' + fill.toFixed(0) + '%');
+    findings.push({
+      kind: 'lowFill',
+      text: fillVersusUsualText_(fill, row.displayedAverageFillRate)
+    });
   }
 
-  if (parts.length === 0) {
-    parts.push('flagged by the digest');
+  if (findings.length === 0) {
+    findings.push({ kind: 'flagged', text: 'Flagged by the digest' });
   }
 
-  return { kind: kind, text: parts.join(', ') };
+  return findings;
 }
 
 /**
- * Explains a seven-day trend drop in everyday words.
+ * Explains a seven-day trend drop. Only used when trendCheckEnabled is true.
  */
 function describeTrendAlert_(alert) {
-  const parts = [];
-  let kind = 'lowFill';
+  const findings = [];
 
   if (alert.countDrop > CONFIG.countDropPercent) {
-    const usual = Math.round(alert.averageCount);
-
-    parts.push(
-      formatNumber_(alert.row.currentCount) + ' records today vs ~' +
-      formatNumber_(usual) + ' usual over ' + alert.historyPoints +
-      ' days (down ' + alert.countDrop.toFixed(0) + '%)'
-    );
-    kind = alert.countDrop >= CONFIG.bigDropPercent && usual >= CONFIG.minimumUsualForRed
-      ? 'bigDrop'
-      : 'smallDrop';
+    findings.push({
+      kind: 'drop',
+      text: countVersusUsualText_(alert.row.currentCount, alert.averageCount)
+    });
   }
 
   if (alert.fillRateDrop > CONFIG.fillRateDropPoints) {
-    parts.push(
-      'fill rate ' + alert.row.currentFillRate.toFixed(0) + '% vs ~' +
-      alert.averageFillRate.toFixed(0) + '% usual'
-    );
+    findings.push({
+      kind: 'lowFill',
+      text: fillVersusUsualText_(alert.row.currentFillRate, alert.averageFillRate)
+    });
   }
 
-  return { kind: kind, text: parts.join(', ') };
+  return findings;
 }
 
 /**
@@ -1689,46 +2216,39 @@ function describeSectionDetail_(sectionKey, detail) {
 
   if (sectionKey === 'failedRuns') {
     const records = detail.recordCount === undefined ? '' : String(detail.recordCount).trim();
-    const recordsText = records === '' ? '' : escapeSlack_(records) + ' records';
 
     if (isSuccess) {
-      return {
-        kind: 'runFailed',
-        text: 'last run finished but returned ' + (recordsText || 'no records'),
-        // A finished run with 0 records is already covered by "0 records today".
-        redundantIfFlagged: /^0+(\.0+)?$/.test(records || '0')
-      };
+      // The run finished but brought nothing back, which is the same problem
+      // as "0 records", so it is called that everywhere.
+      if (/^0+(\.0+)?$/.test(records || '0')) {
+        return { kind: 'noData', text: '0 records', redundantIfFlagged: true };
+      }
+
+      return { kind: 'runFailed', text: 'Run flagged as failed' };
     }
 
     return {
       kind: 'runFailed',
-      text: 'last run ended as ' + escapeSlack_(status || 'failed') +
-        (recordsText ? ' with ' + recordsText : '')
+      text: status === '' || /fail/i.test(status)
+        ? 'Run failed'
+        : 'Run ended as ' + status.toLowerCase()
     };
   }
 
   if (sectionKey === 'missedRuns') {
-    return {
-      kind: 'missedRun',
-      text: 'did not start on time' +
-        (detail.scheduledTime ? ' (was due ' + escapeSlack_(detail.scheduledTime) + ')' : '')
-    };
+    return { kind: 'missedRun', text: 'Missed its schedule' };
   }
 
   if (sectionKey === 'longRunning') {
-    return {
-      kind: 'slowRun',
-      text: 'taking longer than usual' +
-        (detail.runTimeDiff ? ' (over by ' + escapeSlack_(detail.runTimeDiff) + ')' : '')
-    };
+    return { kind: 'slowRun', text: 'Running long' };
   }
 
   if (sectionKey === 'dataValidation') {
     return {
       kind: 'validation',
       text: /fail/i.test(status) || status === ''
-        ? 'QA rules failed'
-        : 'QA rules status: ' + escapeSlack_(status)
+        ? 'QA failed'
+        : 'QA status: ' + status.toLowerCase()
     };
   }
 
@@ -1737,48 +2257,18 @@ function describeSectionDetail_(sectionKey, detail) {
 
     return {
       kind: 'failedTasks',
-      text: Number.isFinite(failedCount) && failedCount > 0
-        ? failedCount + (failedCount === 1 ? ' child process' : ' child processes') + ' failed'
-        : 'a child process failed'
+      text: Number.isFinite(failedCount) && failedCount > 1
+        ? failedCount + ' child processes failed'
+        : 'Child process failed'
     };
   }
 
   if (sectionKey === 'crawlerAnomalies') {
-    return { kind: 'anomaly', text: 'crawler output looks unusual' };
+    return { kind: 'anomaly', text: 'Crawler output looks unusual' };
   }
 
-  return { kind: 'anomaly', text: 'some fields look unusual compared to normal' };
+  return { kind: 'anomaly', text: 'Fields look unusual' };
 }
-
-/**
- * One phrase for the main message, such as
- * "6 reports returned 0 records, 1 far below normal".
- */
-function summarizeIssueKinds_(items) {
-  const counts = {};
-
-  items.forEach(function(item) {
-    counts[item.kind] = (counts[item.kind] || 0) + 1;
-  });
-
-  const kinds = Object.keys(counts).sort(function(a, b) {
-    return ISSUE_KINDS[b].severity - ISSUE_KINDS[a].severity || counts[b] - counts[a];
-  });
-  const parts = kinds.slice(0, 3).map(function(kind, index) {
-    const noun = index === 0 ? alertPlural_(counts[kind], 'report') : String(counts[kind]);
-    return noun + ' ' + ISSUE_KINDS[kind].label;
-  });
-  const hidden = kinds.slice(3).reduce(function(total, kind) {
-    return total + counts[kind];
-  }, 0);
-
-  if (hidden > 0) {
-    parts.push(hidden + ' other');
-  }
-
-  return parts.join(', ');
-}
-
 /**
  * "1 report", "3 reports".
  */
@@ -1803,67 +2293,57 @@ function alertTrim_(text, limit) {
 
   return cut.replace(/[,\s]+$/, '') + '…';
 }
-
 /**
- * Link to today's tab in the tracking sheet.
+ * The project name without its client part: "Averon Group-Averon_Group
+ * (monthly)" becomes "Averon Group (monthly)". It cuts at the last hyphen and
+ * keeps the weekly or monthly label.
  */
-function alertSheetUrl_(spreadsheet, sheetName) {
-  const sheet = spreadsheet.getSheetByName(sheetName);
+function shortProjectName_(projectName) {
+  const full = normalizeText_(projectName);
+  const match = full.match(/^(.*?)((?:\s+\((?:weekly|monthly)\))?)$/i);
+  const base = match ? match[1] : full;
+  const period = match ? match[2] : '';
+  const cut = base.lastIndexOf('-');
+  const short = cut > 0 ? base.slice(0, cut).trim() : base;
 
-  return sheet
-    ? spreadsheet.getUrl() + '#gid=' + sheet.getSheetId()
-    : spreadsheet.getUrl();
+  return (short || base) + period;
 }
 
 /**
- * Groups reports that share the exact same problem text so a project with six
- * identical failures reads as one line instead of six.
+ * Short names for every project in the alert. When two different projects
+ * would end up with the same short name, both keep their full names so they
+ * can still be told apart.
  */
-function groupAlertItems_(items) {
-  const groups = new Map();
+function shortProjectNames_(models) {
+  const fullNamesByShort = new Map();
 
-  items.forEach(function(item) {
-    const text = item.texts.length > 0 ? item.texts.join(', ') : 'needs a look';
-    const key = item.severity + '|' + text;
+  models.forEach(function(model) {
+    const key = shortProjectName_(model.projectName).toLowerCase();
 
-    if (!groups.has(key)) {
-      groups.set(key, { severity: item.severity, text: text, items: [] });
+    if (!fullNamesByShort.has(key)) {
+      fullNamesByShort.set(key, new Set());
     }
 
-    groups.get(key).items.push(item);
+    fullNamesByShort.get(key).add(model.projectName);
   });
 
-  return Array.from(groups.values()).sort(function(a, b) {
-    return b.severity - a.severity ||
-      b.items.length - a.items.length ||
-      a.items[0].report.localeCompare(b.items[0].report);
+  const names = new Map();
+
+  models.forEach(function(model) {
+    const short = shortProjectName_(model.projectName);
+
+    names.set(
+      model.projectName,
+      fullNamesByShort.get(short.toLowerCase()).size > 1 ? model.projectName : short
+    );
   });
+
+  return names;
 }
 
 /**
- * One line for a group. A single report leads with its name, a shared problem
- * leads with the problem and lists the report names after it.
- */
-function alertGroupLine_(group) {
-  const icon = ALERT_ICONS[group.severity];
-
-  if (group.items.length === 1) {
-    return icon + ' *' + slackReportLink_(group.items[0]) + '*: ' + group.text;
-  }
-
-  const shown = group.items.slice(0, CONFIG.maximumGroupNames);
-  let names = shown.map(slackReportLink_).join(', ');
-
-  if (group.items.length > shown.length) {
-    names += ', +' + (group.items.length - shown.length) + ' more';
-  }
-
-  return icon + ' *' + group.text.charAt(0).toUpperCase() + group.text.slice(1) +
-    '* (' + group.items.length + ' reports): ' + names;
-}
-
-/**
- * Splits mrkdwn lines across section blocks under Slack's text limit.
+ * Splits mrkdwn lines across section blocks under Slack's text limit. Used
+ * when Slack refuses a table and the same rows are posted as plain lines.
  */
 function alertSectionBlocks_(blocks, lines) {
   let buffer = [];
@@ -1893,220 +2373,394 @@ function alertSectionBlocks_(blocks, lines) {
 }
 
 /**
- * The main message: a scannable board grouped by urgency, one line per project.
+ * A plain text table cell.
  */
-function buildThreadParentBlocks_(models, sheetUrl) {
-  const groups = { 3: [], 2: [], 1: [] };
-  const groupTitles = { 3: 'Act now', 2: 'Worth a look', 1: 'Still running' };
+function rawCell_(text) {
+  const value = alertTrim_(normalizeText_(text), CONFIG.maximumCellCharacters);
+
+  return { type: 'raw_text', text: value || '-' };
+}
+
+/**
+ * A formatted table cell made of rich text elements (text, emoji, links).
+ */
+function richCell_(elements) {
+  return {
+    type: 'rich_text',
+    elements: [{ type: 'rich_text_section', elements: elements }]
+  };
+}
+
+/**
+ * The Project cell: the short project name, plus the owner's Slack tag when
+ * PROJECT_OWNERS lists one.
+ */
+function projectCell_(name, projectName) {
+  const owner = PROJECT_OWNERS[projectName];
+  const text = alertTrim_(normalizeText_(name), CONFIG.maximumCellCharacters) || '-';
+
+  if (!owner) {
+    return rawCell_(text);
+  }
+
+  return richCell_([
+    { type: 'text', text: text + ' ' },
+    { type: 'user', user_id: owner }
+  ]);
+}
+
+/**
+ * The Report cell: the report name, linked to the report page when the
+ * digest has a link for it.
+ */
+function reportCell_(row) {
+  const name = alertTrim_(normalizeText_(row.report), CONFIG.maximumCellCharacters) || '-';
+  const url = String(row.reportUrl || '').trim();
+
+  if (/^https?:\/\//i.test(url)) {
+    return richCell_([{ type: 'link', url: url, text: name }]);
+  }
+
+  return rawCell_(name);
+}
+
+/**
+ * The Status cell: only the colored dot (red, yellow or hourglass).
+ */
+function statusCell_(severity) {
+  return richCell_([{ type: 'emoji', name: ALERT_EMOJI[severity] }]);
+}
+
+/**
+ * Notification text for the message: "Crawler digest: 5 projects need
+ * action · 8 worth a look · 3 still running". Slack shows it in
+ * notifications; the message itself is only the table.
+ */
+function alertHeadline_(models) {
+  const totals = { 3: 0, 2: 0, 1: 0 };
 
   models.forEach(function(model) {
-    groups[model.severity].push(model);
+    totals[model.severity]++;
   });
 
-  const blocks = [
-    {
-      type: 'header',
-      text: {
-        type: 'plain_text',
-        text: 'Crawler digest: ' + alertPlural_(models.length, 'project') + ' flagged',
-        emoji: true
-      }
-    },
-    {
-      type: 'context',
-      elements: [{
-        type: 'mrkdwn',
-        text: Utilities.formatDate(new Date(), CONFIG.reportTimezone, 'EEE d MMM, HH:mm') +
-          ' ' + CONFIG.reportTimezone +
-          '  ·  "usual" is the average shown in the digest'
-      }]
-    }
+  const parts = [
+    totals[3] === 0
+      ? 'nothing needs action'
+      : alertPlural_(totals[3], 'project') + (totals[3] === 1 ? ' needs' : ' need') + ' action'
   ];
 
-  [3, 2, 1].forEach(function(severity) {
-    const list = groups[severity];
-
-    if (list.length === 0) {
-      return;
-    }
-
-    const lines = [
-      ALERT_ICONS[severity] + ' *' + groupTitles[severity] + ' (' + list.length + ')*'
-    ];
-
-    list.slice(0, CONFIG.maximumProjectLines).forEach(function(model) {
-      lines.push('• *' + escapeSlack_(model.projectName) + '*: ' + model.summary);
-    });
-
-    if (list.length > CONFIG.maximumProjectLines) {
-      lines.push('_+' + (list.length - CONFIG.maximumProjectLines) +
-        ' more, see the sheet._');
-    }
-
-    alertSectionBlocks_(blocks, lines);
-  });
-
-  blocks.push({
-    type: 'context',
-    elements: [{
-      type: 'mrkdwn',
-      text: 'Each project has its details in the thread below. ' +
-        'React with :eyes: when you pick one up and :white_check_mark: when it is fixed.'
-    }]
-  });
-
-  if (sheetUrl) {
-    blocks.push({
-      type: 'actions',
-      elements: [{
-        type: 'button',
-        text: { type: 'plain_text', text: 'Open full sheet', emoji: true },
-        url: sheetUrl,
-        action_id: 'open_sheet'
-      }]
-    });
+  if (totals[2] > 0) {
+    parts.push(totals[2] + ' worth a look');
   }
 
-  return blocks;
+  if (totals[1] > 0) {
+    parts.push(totals[1] + ' still running');
+  }
+
+  return 'Crawler digest: ' + parts.join(' · ');
 }
 
 /**
- * Notification text for the main message.
+ * Every table row of the alert, worst project first and worst report first
+ * inside each project: [Project, Report, Status].
  */
-function buildThreadParentFallback_(models) {
-  const actNow = models.filter(function(model) {
-    return model.severity === 3;
-  }).length;
+function buildAlertTableRows_(models) {
+  const names = shortProjectNames_(models);
+  const rows = [];
 
-  return 'Crawler digest: ' + alertPlural_(models.length, 'project') +
-    ' flagged, ' + actNow + ' need action now.';
+  models.forEach(function(model) {
+    const project = function() {
+      return projectCell_(names.get(model.projectName), model.projectName);
+    };
+    const before = rows.length;
+
+    model.items.forEach(function(item) {
+      rows.push([project(), reportCell_(item), statusCell_(item.severity)]);
+    });
+
+    model.unexplained.forEach(function(section) {
+      rows.push([
+        project(),
+        rawCell_(section.label + ' (' + model.digest.sectionCounts[section.key] + ')'),
+        statusCell_(ALERT_SECTION_SEVERITY[section.key] || 2)
+      ]);
+    });
+
+    model.processing.forEach(function(row) {
+      rows.push([project(), reportCell_(row), statusCell_(1)]);
+    });
+
+    // A flag with no report name still gets a row, so no project disappears.
+    if (rows.length === before) {
+      rows.push([project(), rawCell_('-'), statusCell_(model.severity)]);
+    }
+  });
+
+  return rows;
 }
 
 /**
- * One project's thread reply: the worst reports first, in plain words, with
- * the report name linking straight to the report.
+ * Characters a row adds to a table. With countLinks, link addresses count
+ * too, which is the safe reading of Slack's limit.
  */
-function buildProjectThreadBlocks_(model) {
-  const digest = model.digest;
-  const owner = PROJECT_OWNERS[digest.projectName];
-  const received = Utilities.formatDate(digest.receivedAt, CONFIG.reportTimezone, 'HH:mm');
-  const headLines = [
-    ALERT_ICONS[model.severity] + ' *' + escapeSlack_(digest.projectName) + '*' +
-      (owner ? '  <@' + owner + '>' : '')
-  ];
+function tableRowCharacters_(row, countLinks) {
+  return row.reduce(function(total, cell) {
+    if (cell.type !== 'rich_text') {
+      return total + String(cell.text).length;
+    }
 
-  if (model.items.length > 0) {
-    const total = Math.max(digest.rows.length, model.items.length);
-
-    headLines.push('_' + model.items.length + ' of ' + alertPlural_(total, 'report') +
-      ' affected, digest received ' + received + '_');
-  }
-
-  const blocks = [{
-    type: 'section',
-    text: { type: 'mrkdwn', text: headLines.join('\n') }
-  }];
-  const lines = [];
-  const groups = groupAlertItems_(model.items);
-
-  groups.slice(0, CONFIG.maximumReportLines).forEach(function(group) {
-    lines.push(alertGroupLine_(group));
-  });
-
-  const hiddenReports = groups.slice(CONFIG.maximumReportLines).reduce(function(total, group) {
-    return total + group.items.length;
+    return total + cell.elements[0].elements.reduce(function(sum, element) {
+      return sum + String(element.text || element.name || element.user_id || '').length +
+        (countLinks && element.url ? element.url.length : 0);
+    }, 0);
   }, 0);
+}
 
-  if (hiddenReports > 0) {
-    lines.push('_+' + hiddenReports + ' more reports, open the sheet for the full list._');
-  }
+/**
+ * Splits rows into tables that fit Slack's limits: maximumTableRows rows per
+ * table including the header, and maximumTableCharacters per table.
+ */
+function packTableRows_(rows, countLinks) {
+  const header = [rawCell_('Project'), rawCell_('Report'), rawCell_('Status')];
+  const headerCharacters = tableRowCharacters_(header, countLinks);
+  const tables = [];
+  let current = [];
+  let characters = headerCharacters;
 
-  model.unexplained.forEach(function(section) {
-    lines.push(ALERT_ICONS[3] + ' The digest lists *' + section.label + ' (' +
-      digest.sectionCounts[section.key] + ')* but the details could not be read. ' +
-      'Please check the sheet.');
-  });
+  rows.forEach(function(row) {
+    const size = tableRowCharacters_(row, countLinks);
 
-  if (lines.length > 0) {
-    alertSectionBlocks_(blocks, lines);
-  }
-
-  if (model.processing.length > 0) {
-    const shown = model.processing.slice(0, CONFIG.maximumProcessingNames);
-    let text = ALERT_ICONS[1] + ' Still running: ' + shown.map(slackReportLink_).join(', ');
-
-    if (model.processing.length > shown.length) {
-      text += ', +' + (model.processing.length - shown.length) + ' more';
+    if (current.length > 0 &&
+        (current.length + 1 >= CONFIG.maximumTableRows ||
+         characters + size > CONFIG.maximumTableCharacters)) {
+      tables.push(current);
+      current = [];
+      characters = headerCharacters;
     }
 
-    blocks.push({
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: alertTrim_(text, 2900) }]
-    });
+    current.push(row);
+    characters += size;
+  });
+
+  if (current.length > 0) {
+    tables.push(current);
   }
 
-  return blocks;
-}
-
-/**
- * Posts one project's threaded reply under the main message.
- */
-function postThreadReply_(slack, parent, model) {
-  slackApi_(slack.token, 'chat.postMessage', {
-    channel: parent.channel,
-    thread_ts: parent.ts,
-    text: model.projectName + ': ' + model.summary,
-    blocks: buildProjectThreadBlocks_(model),
-    unfurl_links: false,
-    unfurl_media: false
+  return tables.map(function(tableRows) {
+    return [{
+      type: 'table',
+      column_settings: [{ is_wrapped: true }, { is_wrapped: true }, { is_wrapped: true }],
+      rows: [header].concat(tableRows)
+    }];
   });
 }
 
 /**
- * Posts the main message, then one threaded reply per project that has
- * something to explain. Throws if the main message fails. A reply that fails
- * is tried once more, because the alert only runs once a day. Anything still
- * failing is returned in the outcome.
+ * The messages of one alert, as Slack would get them on a normal day: one
+ * message with the table, or more when the table is too long for one.
  */
-function postAlertThread_(slack, models, sheetUrl) {
-  const parent = slackApi_(slack.token, 'chat.postMessage', {
-    channel: slack.channel,
-    text: buildThreadParentFallback_(models),
-    blocks: buildThreadParentBlocks_(models, sheetUrl),
-    unfurl_links: false,
-    unfurl_media: false
-  });
-  const outcome = { failedMessageIds: [], errors: [] };
-  const failed = [];
-  const threaded = models.filter(function(model) {
-    return model.hasThread;
-  });
+function buildAlertMessages_(models) {
+  const headline = alertHeadline_(models);
+  const tables = packTableRows_(buildAlertTableRows_(models), false);
 
-  threaded.forEach(function(model, index) {
-    // Slack allows roughly one message per second per channel.
+  return tables.map(function(blocks, index) {
+    return {
+      text: index === 0 ? headline : headline + ' (continued ' + (index + 1) + '/' + tables.length + ')',
+      blocks: blocks
+    };
+  });
+}
+
+/**
+ * True for Slack errors caused by the size or shape of the blocks, where
+ * posting smaller tables or plain lines can still succeed.
+ */
+function isLayoutError_(error) {
+  return /invalid_blocks|invalid_attachments|msg_too_long|too_many_attachments|only_one_table|invalid_arguments/i
+    .test(String(error && error.message));
+}
+
+/**
+ * Posts one message. If Slack refuses the layout, the same table is split
+ * with link addresses counted, and any part still refused is posted as plain
+ * lines. Errors that are not about the layout (no access to the channel,
+ * bad token and so on) are thrown.
+ */
+function postTableMessage_(slack, message) {
+  const post = function(text, blocks) {
+    return slackApi_(slack.token, 'chat.postMessage', {
+      channel: slack.channel,
+      text: text,
+      blocks: blocks,
+      unfurl_links: false,
+      unfurl_media: false
+    });
+  };
+
+  try {
+    return post(message.text, message.blocks);
+  } catch (error) {
+    if (!isLayoutError_(error)) {
+      throw error;
+    }
+
+    console.log('Slack refused the table (%s). Posting it in smaller parts.', error.message);
+  }
+
+  const parts = packTableRows_(message.blocks[0].rows.slice(1), true);
+  let first = null;
+
+  parts.forEach(function(blocks, index) {
     if (index > 0) {
       Utilities.sleep(CONFIG.slackReplyDelayMs);
     }
 
+    let response;
+
     try {
-      postThreadReply_(slack, parent, model);
+      response = post(message.text, blocks);
     } catch (error) {
-      failed.push(model);
+      if (!isLayoutError_(error)) {
+        throw error;
+      }
+
+      console.log('Slack refused a table part (%s). Posting it as plain lines.', error.message);
+      response = post(message.text, tablesToSectionBlocks_(blocks));
     }
+
+    first = first || response;
   });
 
-  failed.forEach(function(model, index) {
-    Utilities.sleep(index === 0 ? 3000 : CONFIG.slackReplyDelayMs);
+  return first;
+}
+
+/**
+ * Posts the alert to one channel. Throws if the first message fails, so the
+ * channel keeps its window and gets these digests on the next run. A later
+ * part that fails is tried once more; anything still failing is returned.
+ */
+function postAlertMessage_(slack, models) {
+  const messages = buildAlertMessages_(models);
+  const outcome = { errors: [] };
+
+  postTableMessage_(slack, messages[0]);
+
+  messages.slice(1).forEach(function(message) {
+    Utilities.sleep(CONFIG.slackReplyDelayMs);
 
     try {
-      postThreadReply_(slack, parent, model);
+      postTableMessage_(slack, message);
     } catch (error) {
-      outcome.failedMessageIds.push(model.digest.messageId);
-      outcome.errors.push(model.projectName + ': ' + error.message);
+      Utilities.sleep(3000);
+
+      try {
+        postTableMessage_(slack, message);
+      } catch (retryError) {
+        outcome.errors.push('continued message: ' + retryError.message);
+      }
     }
   });
 
   return outcome;
+}
+
+/**
+ * Replaces every table block with plain mrkdwn lines, one line per row.
+ */
+function tablesToSectionBlocks_(blocks) {
+  const output = [];
+
+  blocks.forEach(function(block) {
+    if (block.type !== 'table') {
+      output.push(block);
+      return;
+    }
+
+    const lines = block.rows.slice(1).map(function(row) {
+      const cells = row.map(tableCellToMrkdwn_);
+
+      return '• ' + cells[0] + '  ·  ' + cells[1] + ': ' + cells[2];
+    });
+
+    alertSectionBlocks_(output, lines);
+  });
+
+  return output;
+}
+
+/**
+ * The text of one table cell as Slack mrkdwn.
+ */
+function tableCellToMrkdwn_(cell) {
+  if (cell.type !== 'rich_text') {
+    return escapeSlack_(cell.text);
+  }
+
+  return cell.elements[0].elements.map(function(element) {
+    if (element.type === 'emoji') {
+      return ':' + element.name + ':';
+    }
+
+    if (element.type === 'user') {
+      return '<@' + element.user_id + '>';
+    }
+
+    if (element.type === 'link') {
+      return '<' + element.url + '|' + escapeSlack_(element.text) + '>';
+    }
+
+    return escapeSlack_(element.text);
+  }).join('');
+}
+
+/**
+ * The whole alert as plain text, for previewPlannedAlert and testing.
+ */
+function alertPreviewText_(models) {
+  return buildAlertMessages_(models).map(function(message, index) {
+    return '=== message ' + (index + 1) + ' (notification: ' + message.text + ') ===\n' +
+      blocksToPlainText_(message.blocks);
+  }).join('\n\n');
+}
+
+/**
+ * Renders Slack blocks as readable plain text, tables included.
+ */
+function blocksToPlainText_(blocks) {
+  const plain = function(text) {
+    return String(text)
+      .replace(/<([^|>]+)\|([^>]+)>/g, '$2')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
+  };
+
+  return blocks.map(function(block) {
+    if (block.type === 'section') {
+      return plain(block.text.text);
+    }
+
+    if (block.type === 'table') {
+      const cells = block.rows.map(function(row) {
+        return row.map(function(cell) {
+          return plain(tableCellToMrkdwn_(cell));
+        });
+      });
+      const widths = cells[0].map(function(header, column) {
+        return Math.max.apply(null, cells.map(function(row) {
+          return row[column].length;
+        }));
+      });
+
+      return cells.map(function(row) {
+        return '| ' + row.map(function(text, column) {
+          return text + new Array(widths[column] - text.length + 1).join(' ');
+        }).join(' | ') + ' |';
+      }).join('\n');
+    }
+
+    return '';
+  }).join('\n');
 }
 
 /**
@@ -2291,18 +2945,6 @@ function escapeSlack_(value) {
 }
 
 /**
- * Returns a clickable report name when the digest contains a report URL.
- */
-function slackReportLink_(row) {
-  const name = escapeSlack_(row.report);
-  const url = row.reportUrl || '';
-
-  return url && url.length <= CONFIG.maximumLinkLength
-    ? '<' + url + '|' + name + '>'
-    : name;
-}
-
-/**
  * Formats large record counts with grouping separators.
  */
 function formatNumber_(value) {
@@ -2322,14 +2964,16 @@ function formatSigned_(value, suffix) {
 }
 
 /**
- * Debug helper: parses the newest digest and logs its evaluation without Slack.
+ * Debug helper: parses the newest digest in the current window (saved start
+ * to now) and logs its evaluation without Slack. Never changes the saved
+ * window.
  */
 function testLatestDigest() {
   const spreadsheet = getBoundSpreadsheet_();
   const currentDigests = loadCurrentDigests_();
 
   if (currentDigests.length === 0) {
-    throw new Error('No digest was found within the last 24 hours.');
+    throw new Error('No digest was found since the last run.');
   }
 
   const latest = currentDigests[currentDigests.length - 1];
@@ -2350,13 +2994,14 @@ function testLatestDigest() {
     alertDetails: latest.alertDetails,
     evaluation: evaluation,
     slackPreview: evaluation.shouldAlert
-      ? buildProjectThreadBlocks_(buildProjectAlertModel_({ digest: latest, result: evaluation }))
+      ? alertPreviewText_([buildProjectAlertModel_({ digest: latest, result: evaluation })])
       : 'No Slack alert.'
   }, null, 2));
 }
 
 /**
- * Debug helper: rebuilds today's sheet without posting anything to Slack.
+ * Debug helper: adds the digests of the current window to today's sheet
+ * without posting anything to Slack. Never changes the saved window.
  */
 function testDailySummarySheet() {
   const spreadsheet = getBoundSpreadsheet_();
@@ -2375,7 +3020,7 @@ function testDailySummarySheet() {
 
   writeDailySummarySheet_(spreadsheet, sheetName, evaluations);
   orderDailySummarySheets_(spreadsheet);
-  console.log('Created %s with %s digest(s) and %s report row(s).',
+  console.log('Updated %s with %s digest(s) and %s report row(s).',
     sheetName,
     evaluations.length,
     buildSummaryRows_(evaluations).length
@@ -2427,14 +3072,10 @@ function testSlackBot() {
 }
 
 /**
- * Manual helper: posts today's alerting digests to the REAL channel in the new
- * format, ignoring the processed list, so the layout can be checked without
- * waiting for a fresh digest. It does not mark anything as processed.
+ * The alert models of the current window (earliest saved start to now),
+ * built the same way a run builds them, without writing the sheet.
  */
-function postAlertThreadNow() {
-  const slack = getSlackBotConfig_();
-  const spreadsheet = getBoundSpreadsheet_();
-  const sheetName = dailySheetName_(new Date());
+function loadAlertModelsNow_(spreadsheet, sheetName) {
   const sheetHistory = loadHistoryFromDailySheets_(spreadsheet, sheetName);
   const evaluations = loadCurrentDigests_().map(function(digest) {
     return {
@@ -2442,29 +3083,51 @@ function postAlertThreadNow() {
       result: evaluateDigest_(digest, getPriorHistory_(digest, sheetHistory))
     };
   });
-  const models = latestDigestPerProject_(evaluations)
-    .filter(function(item) {
-      return item.result.shouldAlert;
-    })
-    .map(function(item) {
-      return buildProjectAlertModel_(item);
-    })
-    .sort(compareAlertModels_);
+
+  return buildAlertModels_(evaluations);
+}
+
+/**
+ * Manual helper: posts the alerting digests of the current window (saved
+ * start to now) to EVERY channel in SLACK_CHANNEL_ID right now, so the
+ * layout can be checked without waiting for a trigger. It does not move the
+ * saved window. To keep it out of the shared channel, put only a test
+ * channel in SLACK_CHANNEL_ID first.
+ */
+function postAlertThreadNow() {
+  const slack = getSlackBotConfig_();
+  const spreadsheet = getBoundSpreadsheet_();
+  const models = loadAlertModelsNow_(spreadsheet, dailySheetName_(new Date()));
 
   if (models.length === 0) {
-    throw new Error('No alerting digests found today to post.');
+    throw new Error('No alerting digests found in the current window to post.');
   }
 
-  const outcome = postAlertToChannels_(
-    slack,
-    slack.channels,
-    models,
-    alertSheetUrl_(spreadsheet, sheetName)
-  );
+  const outcome = postAlertToChannels_(slack, slack.channels, models);
 
   if (outcome.errors.length > 0) {
     throw new Error('Some posts failed: ' + outcome.errors.join(' | '));
   }
+}
+
+/**
+ * Read only check: writes the alert the next run would post (digests since
+ * the saved start) into the execution log as plain text. Posts nothing and
+ * writes nothing.
+ */
+function previewPlannedAlert() {
+  const spreadsheet = getBoundSpreadsheet_();
+  const alertWindow = resolveAlertWindow_(new Date());
+  const models = loadAlertModelsNow_(spreadsheet, dailySheetName_(new Date()));
+
+  console.log('Window: %s to %s.', formatWindowTime_(alertWindow.start), formatWindowTime_(alertWindow.end));
+
+  if (models.length === 0) {
+    console.log('Nothing needs attention. Nothing would be posted.');
+    return;
+  }
+
+  console.log(alertPreviewText_(models));
 }
 
 /**
@@ -2497,4 +3160,68 @@ function checkWeeklyAndMonthlyDigests() {
 
   console.log('%s weekly or monthly digest(s) found in the last %s days, %s could not be read.',
     messages.length, days, unreadable);
+}
+
+/**
+ * Manual helper: sets where the next run's window starts, for every channel,
+ * so a past period can be posted again.
+ *
+ * Usage: EDIT THE DATE BELOW FIRST, run this once, then run
+ * monitorDigestAlerts (or wait for the next trigger). The time is read in
+ * reportTimezone, format 'yyyy-MM-dd HH:mm'. The next run covers everything
+ * from that time up to the moment it runs (capped at maximumWindowHours).
+ * Times more than two days back or in the future are refused, so running it
+ * by accident with an old date cannot flood the channel.
+ */
+function resetWindowTo() {
+  const startText = '2026-10-08 10:00'; // <-- EDIT THIS
+  const match = startText.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})$/);
+
+  if (!match) {
+    throw new Error('Use the format yyyy-MM-dd HH:mm, for example 2026-10-08 10:00.');
+  }
+
+  const now = new Date();
+  const windowStart = localTimeToMilliseconds_(match[1], match[2], match[3]);
+
+  if (windowStart > now.getTime() || now.getTime() - windowStart > 48 * 60 * 60 * 1000) {
+    throw new Error('Pick a time within the last two days. ' + startText +
+      ' is in the future or older than that. Edit startText first.');
+  }
+
+  saveAlertState_(PropertiesService.getScriptProperties(), windowStart, {}, now);
+  console.log('Next run will start from %s (%s).', startText, CONFIG.reportTimezone);
+}
+
+/**
+ * Read only check for report links. Looks at the digests of the last 24
+ * hours and logs every report the alert would show without a link. Posts
+ * nothing and writes nothing.
+ */
+function checkReportLinks() {
+  const now = Date.now();
+  const digests = loadCurrentDigests_({ start: now - 24 * 60 * 60 * 1000, end: now });
+  const models = buildAlertModels_(digests.map(function(digest) {
+    return { digest: digest, result: evaluateDigest_(digest, []) };
+  }));
+  let total = 0;
+  let missing = 0;
+
+  models.forEach(function(model) {
+    model.items.concat(model.processing).forEach(function(row) {
+      total++;
+
+      if (!/^https?:\/\//i.test(String(row.reportUrl || '').trim())) {
+        missing++;
+        console.log('NO LINK | %s | %s', model.projectName, row.report);
+      }
+    });
+  });
+
+  console.log('%s of %s report(s) in the alert have a link.', total - missing, total);
+
+  if (missing > 0) {
+    console.log('For each report listed above, no table in its digest email has a link ' +
+      'in that row. Open one of those digests in Gmail to confirm.');
+  }
 }
